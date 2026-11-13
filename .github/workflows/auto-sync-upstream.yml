@@ -1,0 +1,70 @@
+name: Auto Sync Upstream
+
+# 每 6 小时检查一次上游 huangxd-/danmu_api，有新提交就合并到本 fork 的 main。
+# 设计原则：本工作流永不失败，避免 GitHub 反复发“所有任务均失败”通知邮件。
+#   1) 未配置 SYNC_TOKEN 时直接跳过
+#   2) 上游无新提交时跳过
+#   3) 出现合并冲突时自动中止并记录提示，不报错
+# 所需的 SYNC_TOKEN：GitHub 个人访问令牌（Classic 勾 repo + workflow，或 fine-grained 给本仓库 Contents/Workflows 读写），
+# 因为 GITHUB_TOKEN 无权推送 .github/workflows 文件的改动。
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # 每 6 小时
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-sync-upstream
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    name: Sync upstream into main
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check SYNC_TOKEN
+        id: token
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          if [ -z "$SYNC_TOKEN" ]; then
+            echo "::notice title=已跳过::尚未配置 SYNC_TOKEN 密钥，本次不做同步"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout fork
+        if: steps.token.outputs.skip == 'false'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Merge upstream main
+        if: steps.token.outputs.skip == 'false'
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/huangxd-/danmu_api.git 2>/dev/null || true
+          git fetch --no-tags upstream main
+          TARGET=$(git rev-parse upstream/main)
+          echo "upstream head: $TARGET"
+          if git merge-base --is-ancestor "$TARGET" HEAD; then
+            echo "::notice title=已是最新::上游无新提交，跳过"
+            exit 0
+          fi
+          if git merge --no-edit -m "chore: 同步上游最新代码 [skip ci]" upstream/main; then
+            git push origin HEAD:main
+            echo "::notice title=同步完成::已合并上游最新提交"
+          else
+            git merge --abort || true
+            echo "::warning title=需人工处理::上游更新与本地改动存在冲突，本次已跳过，请到仓库首页手动 Sync fork"
+            exit 0
+          fi
